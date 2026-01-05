@@ -886,6 +886,10 @@ def main():
                 loss = loss_dict["total_loss"]
                 
                 accelerator.backward(loss)
+                
+                # Track if we manually unscaled (for FP16 mixed precision)
+                manually_unscaled = False
+                
                 if accelerator.sync_gradients:
                     # Collect parameters for gradient clipping
                     if args.train_text_encoder:
@@ -898,24 +902,30 @@ def main():
                         params_to_clip = list(transformer_lora_parameters)
                     
                     # Clip gradients - handle FP16 mixed precision issue
-                    # When using FP16, accelerator.clip_grad_norm_ has issues, so we skip clipping
-                    # or use manual clipping after unscaling
-                    if accelerator.mixed_precision == "fp16" or accelerator.mixed_precision == "bf16":
-                        # For mixed precision, manually unscale and clip
-                        if accelerator.scaler is not None:
-                            # Unscale gradients
-                            accelerator.scaler.unscale_(optimizer)
-                            # Clip gradients manually
-                            torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
-                        else:
-                            # No scaler, clip directly
-                            torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
-                    else:
-                        # For FP32, use accelerator's method
+                    # accelerator.clip_grad_norm_() has issues with FP16, so we handle it differently
+                    use_mixed_precision = accelerator.mixed_precision in ["fp16", "bf16"]
+                    
+                    if use_mixed_precision and accelerator.scaler is not None:
+                        # For FP16/BF16 with scaler: manually unscale, clip, then use optimizer.step() directly
+                        accelerator.scaler.unscale_(optimizer)
+                        manually_unscaled = True
+                        # Clip gradients after unscaling (gradients are now in FP32)
+                        torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
+                    elif not use_mixed_precision:
+                        # For FP32: use accelerator's method
                         accelerator.clip_grad_norm_(params_to_clip, 1.0)
+                    else:
+                        # FP16/BF16 without scaler: clip directly (less common)
+                        torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
                 
                 # Optimizer step - handle scaler properly
-                if accelerator.scaler is not None:
+                # If we manually unscaled, use optimizer.step() directly, otherwise use scaler.step()
+                if manually_unscaled:
+                    # Already unscaled manually, so use optimizer.step() directly
+                    optimizer.step()
+                    accelerator.scaler.update()
+                elif accelerator.scaler is not None:
+                    # Use scaler.step() which will unscale internally
                     accelerator.scaler.step(optimizer)
                     accelerator.scaler.update()
                 else:
