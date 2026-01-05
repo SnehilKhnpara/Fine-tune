@@ -1,0 +1,831 @@
+#!/usr/bin/env python
+# coding=utf-8
+"""
+Training script for Arabic diffusion fine-tuning using LoRA.
+
+This script implements Approach 3: Fine-tuned Arabic Diffusion.
+It trains LoRA adapters to improve Arabic text understanding and rendering.
+
+IMPORTANT:
+- This is a RESEARCH phase, not production dependency
+- Production correctness MUST remain guaranteed by Approach 1 (mask/overlay)
+- OCR is ONLY used during training, NEVER during inference
+"""
+
+import argparse
+import copy
+import gc
+import itertools
+import logging
+import math
+import os
+import random
+import shutil
+import warnings
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import numpy as np
+import torch
+import torch.utils.checkpoint
+import transformers
+from accelerate import Accelerator
+from accelerate.logging import get_logger
+from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
+from huggingface_hub import create_repo, upload_folder
+from peft import LoraConfig, set_peft_model_state_dict
+from peft.utils import get_peft_model_state_dict
+from PIL import Image
+from torch.utils.data import Dataset
+from torchvision import transforms
+from tqdm.auto import tqdm
+from transformers import CLIPTokenizer, PretrainedConfig, T5TokenizerFast
+
+import diffusers
+from diffusers import (
+    AutoencoderKL,
+    FlowMatchEulerDiscreteScheduler,
+    SD3Transformer2DModel,
+    StableDiffusion3Pipeline,
+)
+from diffusers.optimization import get_scheduler
+from diffusers.training_utils import (
+    _set_state_dict_into_text_encoder,
+    cast_training_params,
+    compute_density_for_timestep_sampling,
+    compute_loss_weighting_for_sd3,
+)
+from diffusers.utils import (
+    check_min_version,
+    convert_unet_state_dict_to_peft,
+    is_wandb_available,
+)
+from diffusers.utils.torch_utils import is_compiled_module
+
+# Import our custom modules
+try:
+    from .dataset import SyntheticArabicDataset, EvArESTDataset, CombinedArabicDataset
+    from .losses import CombinedLoss, OCRGuidedLoss, RTLDirectionalityLoss
+    from .ocr_loss import OCRWrapper
+except ImportError:
+    # Fallback for direct execution
+    from dataset import SyntheticArabicDataset, EvArESTDataset, CombinedArabicDataset
+    from losses import CombinedLoss, OCRGuidedLoss, RTLDirectionalityLoss
+    from ocr_loss import OCRWrapper
+
+if is_wandb_available():
+    import wandb
+
+check_min_version("0.30.0")
+
+logger = get_logger(__name__)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Arabic diffusion LoRA training script.")
+    
+    # Model arguments
+    parser.add_argument(
+        "--pretrained_model_name_or_path",
+        type=str,
+        default="stabilityai/stable-diffusion-3-medium-diffusers",
+        help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        help="Revision of pretrained model identifier.",
+    )
+    parser.add_argument(
+        "--variant",
+        type=str,
+        default=None,
+        help="Variant of the model files (e.g., fp16).",
+    )
+    
+    # Dataset arguments
+    parser.add_argument(
+        "--arabic_words_file",
+        type=str,
+        default=None,
+        help="Path to file containing Arabic words (one per line).",
+    )
+    parser.add_argument(
+        "--evarest_data_dir",
+        type=str,
+        default=None,
+        help="Path to EvArEST dataset directory.",
+    )
+    parser.add_argument(
+        "--synthetic_num_samples",
+        type=int,
+        default=10000,
+        help="Number of synthetic samples to generate.",
+    )
+    parser.add_argument(
+        "--evarest_weight",
+        type=float,
+        default=0.1,
+        help="Weight of EvArEST samples in combined dataset.",
+    )
+    
+    # Training arguments
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="arabic-lora-output",
+        help="The output directory where the model predictions and checkpoints will be written.",
+    )
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=1024,
+        help="The resolution for input images.",
+    )
+    parser.add_argument(
+        "--train_batch_size",
+        type=int,
+        default=4,
+        help="Batch size (per device) for the training dataloader.",
+    )
+    parser.add_argument(
+        "--num_train_epochs",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--max_train_steps",
+        type=int,
+        default=None,
+        help="Total number of training steps to perform.",
+    )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Number of updates steps to accumulate before performing a backward/update pass.",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Whether or not to use gradient checkpointing to save memory.",
+    )
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=1e-4,
+        help="Initial learning rate.",
+    )
+    parser.add_argument(
+        "--text_encoder_lr",
+        type=float,
+        default=5e-6,
+        help="Text encoder learning rate.",
+    )
+    parser.add_argument(
+        "--scale_lr",
+        action="store_true",
+        help="Scale the learning rate by the number of GPUs, gradient accumulation steps, and batch size.",
+    )
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        default="constant",
+        choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"],
+    )
+    parser.add_argument(
+        "--lr_warmup_steps",
+        type=int,
+        default=500,
+        help="Number of steps for the warmup in the lr scheduler.",
+    )
+    parser.add_argument(
+        "--rank",
+        type=int,
+        default=4,
+        help="The dimension of the LoRA update matrices.",
+    )
+    parser.add_argument(
+        "--train_text_encoder",
+        action="store_true",
+        help="Whether to train the text encoder.",
+    )
+    
+    # OCR and loss arguments
+    parser.add_argument(
+        "--enable_ocr_loss",
+        action="store_true",
+        help="Enable OCR-guided loss.",
+    )
+    parser.add_argument(
+        "--ocr_type",
+        type=str,
+        default="paddleocr",
+        choices=["paddleocr", "tesseract"],
+        help="OCR engine to use.",
+    )
+    parser.add_argument(
+        "--ocr_loss_weight",
+        type=float,
+        default=0.1,
+        help="Weight for OCR-guided loss.",
+    )
+    parser.add_argument(
+        "--enable_rtl_loss",
+        action="store_true",
+        help="Enable RTL directionality penalty.",
+    )
+    parser.add_argument(
+        "--rtl_loss_weight",
+        type=float,
+        default=0.05,
+        help="Weight for RTL directionality loss.",
+    )
+    
+    # Other arguments
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="A seed for reproducible training.",
+    )
+    parser.add_argument(
+        "--checkpointing_steps",
+        type=int,
+        default=500,
+        help="Save a checkpoint every X updates steps.",
+    )
+    parser.add_argument(
+        "--checkpoints_total_limit",
+        type=int,
+        default=None,
+        help="Max number of checkpoints to store.",
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Whether training should be resumed from a previous checkpoint.",
+    )
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default=None,
+        choices=["no", "fp16", "bf16"],
+        help="Whether to use mixed precision.",
+    )
+    parser.add_argument(
+        "--report_to",
+        type=str,
+        default="tensorboard",
+        choices=["tensorboard", "wandb"],
+        help="The integration to report results and logs to.",
+    )
+    parser.add_argument(
+        "--validation_prompt",
+        type=str,
+        default=None,
+        help="A prompt that is used during validation.",
+    )
+    parser.add_argument(
+        "--num_validation_images",
+        type=int,
+        default=4,
+        help="Number of images that should be generated during validation.",
+    )
+    parser.add_argument(
+        "--validation_epochs",
+        type=int,
+        default=50,
+        help="Run validation every X epochs.",
+    )
+    parser.add_argument(
+        "--allow_tf32",
+        action="store_true",
+        help="Whether or not to allow TF32 on Ampere GPUs.",
+    )
+    parser.add_argument(
+        "--dataloader_num_workers",
+        type=int,
+        default=0,
+        help="Number of subprocesses to use for data loading.",
+    )
+    
+    # SD3-specific arguments
+    parser.add_argument(
+        "--max_sequence_length",
+        type=int,
+        default=256,
+        help="Maximum sequence length for T5 text encoder.",
+    )
+    parser.add_argument(
+        "--weighting_scheme",
+        type=str,
+        default="logit_normal",
+        choices=["sigma_sqrt", "logit_normal", "mode", "cosmap"],
+    )
+    parser.add_argument(
+        "--precondition_outputs",
+        type=int,
+        default=1,
+        help="Flag indicating if we are preconditioning the model outputs.",
+    )
+    
+    args = parser.parse_args()
+    
+    # Validation
+    if args.arabic_words_file is None:
+        raise ValueError("--arabic_words_file is required. Provide a file with Arabic words (one per line).")
+    
+    if not os.path.exists(args.arabic_words_file):
+        raise ValueError(f"Arabic words file not found: {args.arabic_words_file}")
+    
+    return args
+
+
+def load_arabic_words(file_path: str) -> List[str]:
+    """Load Arabic words from file (one per line)."""
+    words = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            word = line.strip()
+            if word:
+                words.append(word)
+    return words
+
+
+def main():
+    args = parse_args()
+    
+    logging_dir = Path(args.output_dir, "logs")
+    
+    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
+    kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=args.mixed_precision,
+        log_with=args.report_to,
+        project_config=accelerator_project_config,
+        kwargs_handlers=[kwargs],
+    )
+    
+    if args.report_to == "wandb":
+        if not is_wandb_available():
+            raise ImportError("Make sure to install wandb if you want to use it for logging.")
+    
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
+    logger.info(accelerator.state, main_process_only=False)
+    
+    if accelerator.is_local_main_process:
+        transformers.utils.logging.set_verbosity_warning()
+        diffusers.utils.logging.set_verbosity_info()
+    else:
+        transformers.utils.logging.set_verbosity_error()
+        diffusers.utils.logging.set_verbosity_error()
+    
+    if args.seed is not None:
+        set_seed(args.seed)
+    
+    # Handle repository creation
+    if accelerator.is_main_process:
+        if args.output_dir is not None:
+            os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Load Arabic words
+    arabic_words = load_arabic_words(args.arabic_words_file)
+    logger.info(f"Loaded {len(arabic_words)} Arabic words")
+    
+    # Create datasets
+    synthetic_dataset = SyntheticArabicDataset(
+        arabic_words=arabic_words,
+        size=args.resolution,
+        num_samples=args.synthetic_num_samples,
+    )
+    
+    evarest_dataset = None
+    if args.evarest_data_dir:
+        try:
+            evarest_dataset = EvArESTDataset(
+                data_dir=args.evarest_data_dir,
+                split="train",
+                size=args.resolution,
+                recognition_only=True,
+            )
+            logger.info(f"Loaded EvArEST dataset with {len(evarest_dataset)} samples")
+        except Exception as e:
+            logger.warning(f"Could not load EvArEST dataset: {e}. Continuing without it.")
+    
+    train_dataset = CombinedArabicDataset(
+        synthetic_dataset=synthetic_dataset,
+        evarest_dataset=evarest_dataset,
+        evarest_weight=args.evarest_weight,
+    )
+    
+    # Initialize OCR (if enabled)
+    ocr_wrapper = None
+    if args.enable_ocr_loss:
+        ocr_wrapper = OCRWrapper(ocr_type=args.ocr_type, lang="ar")
+        if not ocr_wrapper.is_available():
+            logger.warning("OCR is not available. OCR loss will be disabled.")
+            args.enable_ocr_loss = False
+    
+    # Create loss functions
+    ocr_loss_fn = None
+    if args.enable_ocr_loss and ocr_wrapper:
+        ocr_loss_fn = OCRGuidedLoss(
+            ocr_model=ocr_wrapper,
+            weight=args.ocr_loss_weight,
+        )
+    
+    rtl_loss_fn = None
+    if args.enable_rtl_loss:
+        rtl_loss_fn = RTLDirectionalityLoss(weight=args.rtl_loss_weight)
+    
+    combined_loss_fn = CombinedLoss(
+        ocr_loss_fn=ocr_loss_fn,
+        rtl_loss_fn=rtl_loss_fn,
+        ocr_loss_weight=args.ocr_loss_weight,
+        rtl_loss_weight=args.rtl_loss_weight,
+    )
+    
+    # Load tokenizers and models
+    tokenizer_one = CLIPTokenizer.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="tokenizer",
+        revision=args.revision,
+    )
+    tokenizer_two = CLIPTokenizer.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="tokenizer_2",
+        revision=args.revision,
+    )
+    tokenizer_three = T5TokenizerFast.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="tokenizer_3",
+        revision=args.revision,
+    )
+    
+    # Import text encoder classes
+    text_encoder_config = PretrainedConfig.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
+    )
+    model_class = text_encoder_config.architectures[0]
+    if model_class == "CLIPTextModelWithProjection":
+        from transformers import CLIPTextModelWithProjection
+        text_encoder_cls_one = CLIPTextModelWithProjection
+        text_encoder_cls_two = CLIPTextModelWithProjection
+    else:
+        raise ValueError(f"{model_class} is not supported.")
+    
+    from transformers import T5EncoderModel
+    text_encoder_cls_three = T5EncoderModel
+    
+    # Load models
+    noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="scheduler"
+    )
+    noise_scheduler_copy = copy.deepcopy(noise_scheduler)
+    
+    text_encoder_one = text_encoder_cls_one.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
+    )
+    text_encoder_two = text_encoder_cls_two.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant
+    )
+    text_encoder_three = text_encoder_cls_three.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder_3", revision=args.revision, variant=args.variant
+    )
+    
+    vae = AutoencoderKL.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="vae",
+        revision=args.revision,
+        variant=args.variant,
+    )
+    transformer = SD3Transformer2DModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
+    )
+    
+    # Freeze models
+    transformer.requires_grad_(False)
+    vae.requires_grad_(False)
+    text_encoder_one.requires_grad_(False)
+    text_encoder_two.requires_grad_(False)
+    text_encoder_three.requires_grad_(False)
+    
+    # Set weight dtype
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+    
+    vae.to(accelerator.device, dtype=torch.float32)
+    transformer.to(accelerator.device, dtype=weight_dtype)
+    text_encoder_one.to(accelerator.device, dtype=weight_dtype)
+    text_encoder_two.to(accelerator.device, dtype=weight_dtype)
+    text_encoder_three.to(accelerator.device, dtype=weight_dtype)
+    
+    if args.gradient_checkpointing:
+        transformer.enable_gradient_checkpointing()
+        if args.train_text_encoder:
+            text_encoder_one.gradient_checkpointing_enable()
+            text_encoder_two.gradient_checkpointing_enable()
+    
+    # Add LoRA adapters
+    transformer_lora_config = LoraConfig(
+        r=args.rank,
+        lora_alpha=args.rank,
+        init_lora_weights="gaussian",
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+    )
+    transformer.add_adapter(transformer_lora_config)
+    
+    if args.train_text_encoder:
+        text_lora_config = LoraConfig(
+            r=args.rank,
+            lora_alpha=args.rank,
+            init_lora_weights="gaussian",
+            target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+        )
+        text_encoder_one.add_adapter(text_lora_config)
+        text_encoder_two.add_adapter(text_lora_config)
+    
+    # Create data loader
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.train_batch_size,
+        shuffle=True,
+        num_workers=args.dataloader_num_workers,
+    )
+    
+    # Optimizer
+    transformer_lora_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
+    if args.train_text_encoder:
+        text_lora_parameters_one = list(filter(lambda p: p.requires_grad, text_encoder_one.parameters()))
+        text_lora_parameters_two = list(filter(lambda p: p.requires_grad, text_encoder_two.parameters()))
+    
+    transformer_parameters_with_lr = {"params": transformer_lora_parameters, "lr": args.learning_rate}
+    if args.train_text_encoder:
+        text_lora_parameters_one_with_lr = {
+            "params": text_lora_parameters_one,
+            "lr": args.text_encoder_lr if args.text_encoder_lr else args.learning_rate,
+        }
+        text_lora_parameters_two_with_lr = {
+            "params": text_lora_parameters_two,
+            "lr": args.text_encoder_lr if args.text_encoder_lr else args.learning_rate,
+        }
+        params_to_optimize = [
+            transformer_parameters_with_lr,
+            text_lora_parameters_one_with_lr,
+            text_lora_parameters_two_with_lr,
+        ]
+    else:
+        params_to_optimize = [transformer_parameters_with_lr]
+    
+    optimizer = torch.optim.AdamW(
+        params_to_optimize,
+        lr=args.learning_rate,
+        betas=(0.9, 0.999),
+        weight_decay=1e-4,
+        eps=1e-8,
+    )
+    
+    # Scheduler
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if args.max_train_steps is None:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
+        num_training_steps=args.max_train_steps * accelerator.num_processes,
+    )
+    
+    # Prepare with accelerator
+    if args.train_text_encoder:
+        transformer, text_encoder_one, text_encoder_two, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            transformer, text_encoder_one, text_encoder_two, optimizer, train_dataloader, lr_scheduler
+        )
+    else:
+        transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            transformer, optimizer, train_dataloader, lr_scheduler
+        )
+    
+    # Initialize trackers
+    if accelerator.is_main_process:
+        tracker_name = "arabic-diffusion-lora"
+        accelerator.init_trackers(tracker_name, config=vars(args))
+    
+    # Training loop
+    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    
+    logger.info("***** Running training *****")
+    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
+    logger.info(f"  Num Epochs = {args.num_train_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    logger.info(f"  Total train batch size = {total_batch_size}")
+    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    
+    global_step = 0
+    first_epoch = 0
+    
+    # Resume from checkpoint
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint != "latest":
+            path = os.path.basename(args.resume_from_checkpoint)
+        else:
+            dirs = os.listdir(args.output_dir)
+            dirs = [d for d in dirs if d.startswith("checkpoint")]
+            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+            path = dirs[-1] if len(dirs) > 0 else None
+        
+        if path is None:
+            logger.info(f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting new training.")
+            args.resume_from_checkpoint = None
+        else:
+            logger.info(f"Resuming from checkpoint {path}")
+            accelerator.load_state(os.path.join(args.output_dir, path))
+            global_step = int(path.split("-")[1])
+            first_epoch = global_step // num_update_steps_per_epoch
+    
+    progress_bar = tqdm(
+        range(0, args.max_train_steps),
+        initial=global_step,
+        desc="Steps",
+        disable=not accelerator.is_local_main_process,
+    )
+    
+    def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
+        sigmas = noise_scheduler_copy.sigmas.to(device=accelerator.device, dtype=dtype)
+        schedule_timesteps = noise_scheduler_copy.timesteps.to(accelerator.device)
+        timesteps = timesteps.to(accelerator.device)
+        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+        sigma = sigmas[step_indices].flatten()
+        while len(sigma.shape) < n_dim:
+            sigma = sigma.unsqueeze(-1)
+        return sigma
+    
+    # Encode prompt helper (simplified - would need full implementation)
+    def encode_prompt(prompts, text_encoders, tokenizers, max_sequence_length):
+        # This is a placeholder - full implementation needed
+        # Would need to implement similar to train_dreambooth_lora_sd3.py
+        raise NotImplementedError("Prompt encoding needs full implementation")
+    
+    # Training loop
+    for epoch in range(first_epoch, args.num_train_epochs):
+        transformer.train()
+        if args.train_text_encoder:
+            text_encoder_one.train()
+            text_encoder_two.train()
+        
+        for step, batch in enumerate(train_dataloader):
+            with accelerator.accumulate(transformer):
+                pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
+                prompts = batch["prompt"]  # List of Arabic text prompts
+                target_texts = batch["text"]  # For OCR loss
+                
+                # Encode prompts (simplified - needs full implementation)
+                # For now, we'll skip OCR loss in this simplified version
+                # In full implementation, would encode prompts properly
+                
+                # Convert images to latent space
+                model_input = vae.encode(pixel_values).latent_dist.sample()
+                model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
+                model_input = model_input.to(dtype=weight_dtype)
+                
+                # Sample noise
+                noise = torch.randn_like(model_input)
+                bsz = model_input.shape[0]
+                
+                # Sample timesteps
+                u = compute_density_for_timestep_sampling(
+                    weighting_scheme=args.weighting_scheme,
+                    batch_size=bsz,
+                    logit_mean=0.0,
+                    logit_std=1.0,
+                    mode_scale=1.29,
+                )
+                indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
+                timesteps = noise_scheduler_copy.timesteps[indices].to(device=model_input.device)
+                
+                # Add noise
+                sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
+                noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
+                
+                # For now, use dummy prompt embeddings
+                # In full implementation, would encode prompts properly
+                dummy_prompt_embeds = torch.zeros(
+                    (bsz, 77, 1024), device=accelerator.device, dtype=weight_dtype
+                )
+                dummy_pooled_embeds = torch.zeros((bsz, 1024), device=accelerator.device, dtype=weight_dtype)
+                
+                # Predict
+                model_pred = transformer(
+                    hidden_states=noisy_model_input,
+                    timestep=timesteps,
+                    encoder_hidden_states=dummy_prompt_embeds,
+                    pooled_projections=dummy_pooled_embeds,
+                    return_dict=False,
+                )[0]
+                
+                # Preconditioning
+                if args.precondition_outputs:
+                    model_pred = model_pred * (-sigmas) + noisy_model_input
+                
+                # Compute weighting
+                weighting = compute_loss_weighting_for_sd3(
+                    weighting_scheme=args.weighting_scheme, sigmas=sigmas
+                )
+                
+                # Compute target
+                if args.precondition_outputs:
+                    target = model_input
+                else:
+                    target = noise - model_input
+                
+                # Standard diffusion loss
+                diffusion_loss = torch.mean(
+                    (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
+                    1,
+                )
+                diffusion_loss = diffusion_loss.mean()
+                
+                # Combined loss (OCR loss would be added here if enabled and properly implemented)
+                loss_dict = combined_loss_fn(
+                    diffusion_loss=diffusion_loss,
+                    generated_image=None,  # Would decode image for OCR loss
+                    target_text=target_texts[0] if target_texts else None,
+                    prompt_embeds=None,  # Would use actual prompt embeddings
+                )
+                loss = loss_dict["total_loss"]
+                
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    params_to_clip = (
+                        itertools.chain(transformer_lora_parameters, text_lora_parameters_one, text_lora_parameters_two)
+                        if args.train_text_encoder
+                        else transformer_lora_parameters
+                    )
+                    accelerator.clip_grad_norm_(params_to_clip, 1.0)
+                
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+            
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                global_step += 1
+                
+                if accelerator.is_main_process:
+                    if global_step % args.checkpointing_steps == 0:
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        accelerator.save_state(save_path)
+                        logger.info(f"Saved state to {save_path}")
+                
+                logs = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in loss_dict.items()}
+                logs["lr"] = lr_scheduler.get_last_lr()[0]
+                progress_bar.set_postfix(**logs)
+                accelerator.log(logs, step=global_step)
+            
+            if global_step >= args.max_train_steps:
+                break
+    
+    # Save final LoRA weights
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        transformer = accelerator.unwrap_model(transformer)
+        transformer = transformer.to(torch.float32)
+        transformer_lora_layers = get_peft_model_state_dict(transformer)
+        
+        if args.train_text_encoder:
+            text_encoder_one = accelerator.unwrap_model(text_encoder_one)
+            text_encoder_lora_layers = get_peft_model_state_dict(text_encoder_one.to(torch.float32))
+            text_encoder_two = accelerator.unwrap_model(text_encoder_two)
+            text_encoder_2_lora_layers = get_peft_model_state_dict(text_encoder_two.to(torch.float32))
+        else:
+            text_encoder_lora_layers = None
+            text_encoder_2_lora_layers = None
+        
+        StableDiffusion3Pipeline.save_lora_weights(
+            save_directory=args.output_dir,
+            transformer_lora_layers=transformer_lora_layers,
+            text_encoder_lora_layers=text_encoder_lora_layers,
+            text_encoder_2_lora_layers=text_encoder_2_lora_layers,
+        )
+        logger.info(f"Saved LoRA weights to {args.output_dir}")
+    
+    accelerator.end_training()
+
+
+if __name__ == "__main__":
+    main()
+

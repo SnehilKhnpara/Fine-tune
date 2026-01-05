@@ -1,0 +1,28 @@
+# Requirements for Arabic Diffusion Fine-tuning (Approach 3)
+# Install these in addition to the main project requirements
+
+# Core dependencies (should already be installed)
+# torch
+# torchvision
+# transformers
+# diffusers
+# accelerate
+# peft
+
+# OCR support (choose one or both)
+paddlepaddle>=2.5.0
+paddleocr>=2.7.0
+# OR
+# pytesseract>=0.3.10
+
+# Arabic text processing
+arabic-reshaper>=3.0.0
+python-bidi>=0.4.2
+
+# Optional: For better Arabic font support
+# fonttools>=4.0.0
+
+# Logging (optional)
+wandb>=0.15.0
+tensorboard>=2.13.0
+
