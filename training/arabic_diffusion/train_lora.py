@@ -929,21 +929,10 @@ def main():
                     # For FP16/BF16: skip gradient clipping to avoid scaler issues
                     # The scaler will handle gradient scaling automatically
                 
-                # Optimizer step - SIMPLIFIED: skip gradient clipping for FP16 to avoid scaler conflicts
-                # The simplest solution: don't manually unscale, just skip clipping for FP16
-                # Gradient clipping is helpful but not critical - training will work without it
-                if use_mixed_precision and has_scaler:
-                    # For FP16: skip clipping, use scaler normally
-                    # This avoids the "Attempting to unscale FP16 gradients" error
-                    accelerator.scaler.step(optimizer)
-                    accelerator.scaler.update()
-                elif has_scaler:
-                    # FP32 with scaler: use scaler.step() normally
-                    accelerator.scaler.step(optimizer)
-                    accelerator.scaler.update()
-                else:
-                    # No scaler: use optimizer.step() directly
-                    optimizer.step()
+                # Optimizer step
+                # With cast_training_params, trainable params are in FP32
+                # Use optimizer.step() directly - accelerator handles scaler internally
+                optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
             
