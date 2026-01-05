@@ -897,21 +897,10 @@ def main():
                     else:
                         params_to_clip = list(transformer_lora_parameters)
                     
-                    # Clip gradients - handle mixed precision properly
-                    if accelerator.mixed_precision == "fp16" or accelerator.mixed_precision == "bf16":
-                        # For mixed precision, use torch's clip_grad_norm_ directly after unscaling
-                        if accelerator.scaler is not None:
-                            accelerator.scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
-                    else:
-                        # For fp32, use accelerator's method
-                        accelerator.clip_grad_norm_(params_to_clip, 1.0)
+                    # Clip gradients - accelerator handles mixed precision automatically
+                    accelerator.clip_grad_norm_(params_to_clip, 1.0)
                 
-                if accelerator.scaler is not None:
-                    accelerator.scaler.step(optimizer)
-                    accelerator.scaler.update()
-                else:
-                    optimizer.step()
+                optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
             
