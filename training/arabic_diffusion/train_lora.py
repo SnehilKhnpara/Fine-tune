@@ -564,6 +564,14 @@ def main():
         num_workers=args.dataloader_num_workers,
     )
     
+    # CRITICAL: Cast trainable parameters to FP32 for mixed precision training
+    # This ensures gradients are in FP32, which the scaler can handle properly
+    if accelerator.mixed_precision in ["fp16", "bf16"]:
+        models_to_cast = [transformer]
+        if args.train_text_encoder:
+            models_to_cast.extend([text_encoder_one, text_encoder_two])
+        cast_training_params(models_to_cast, dtype=torch.float32)
+    
     # Optimizer
     transformer_lora_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
     if args.train_text_encoder:
@@ -607,6 +615,15 @@ def main():
         num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
         num_training_steps=args.max_train_steps * accelerator.num_processes,
     )
+    
+    # CRITICAL: Cast trainable parameters to FP32 for mixed precision training
+    # This ensures gradients are in FP32, which the scaler can handle properly
+    # Must be done BEFORE accelerator.prepare()
+    if accelerator.mixed_precision in ["fp16", "bf16"]:
+        models_to_cast = [transformer]
+        if args.train_text_encoder:
+            models_to_cast.extend([text_encoder_one, text_encoder_two])
+        cast_training_params(models_to_cast, dtype=torch.float32)
     
     # Prepare with accelerator
     if args.train_text_encoder:
