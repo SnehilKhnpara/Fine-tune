@@ -13,23 +13,84 @@ def run(args):
         prompts = file.readlines()
     
     if args.model_type == "sd3":
+        # Use float32 for SD3 to match LoRA weights (LoRA was saved in float32)
         pipe = StableDiffusion3Pipeline.from_pretrained("stabilityai/stable-diffusion-3-medium-diffusers", torch_dtype=torch.float32)
         guidance_scale = 7.0
+        
+        # Ensure text encoders are in float32 for LoRA loading compatibility
+        if hasattr(pipe, 'text_encoder') and pipe.text_encoder is not None:
+            pipe.text_encoder = pipe.text_encoder.to(dtype=torch.float32)
+        if hasattr(pipe, 'text_encoder_2') and pipe.text_encoder_2 is not None:
+            pipe.text_encoder_2 = pipe.text_encoder_2.to(dtype=torch.float32)
+        if hasattr(pipe, 'text_encoder_3') and pipe.text_encoder_3 is not None:
+            pipe.text_encoder_3 = pipe.text_encoder_3.to(dtype=torch.float32)
     elif args.model_type == "flux":
         pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16)
         guidance_scale = 3.5
     elif args.model_type == "auraflow": 
         pipe = AuraFlowPipeline.from_pretrained("fal/AuraFlow", torch_dtype=torch.float16)
         guidance_scale = 3.5
-    pipe.enable_model_cpu_offload()
     
+    # Load Arabic LoRA BEFORE enabling CPU offload to avoid dtype issues
     # Load Arabic LoRA if specified (Approach 3: Fine-tuned Arabic Diffusion)
     if args.arabic_diffusion_mode != "off" and args.arabic_lora_path:
         try:
-            pipe.load_lora_weights(args.arabic_lora_path)
-            print(f"Loaded Arabic LoRA from {args.arabic_lora_path}")
+            # Handle both local paths and HuggingFace repo IDs
+            lora_path = args.arabic_lora_path
+            
+            # Convert to absolute path if it's a relative path
+            if not os.path.isabs(lora_path):
+                # Try multiple possible locations
+                possible_paths = [
+                    lora_path,  # Current directory
+                    os.path.join("training", "arabic_diffusion", lora_path),  # Training subdirectory
+                    os.path.join("arabic-lora-output", lora_path),  # Alternative location
+                ]
+                
+                found_path = None
+                for path in possible_paths:
+                    if os.path.exists(path):
+                        found_path = os.path.abspath(path)
+                        break
+                    # Also check if it's a directory with safetensors file inside
+                    safetensors_in_dir = os.path.join(path, "pytorch_lora_weights.safetensors")
+                    if os.path.exists(safetensors_in_dir):
+                        found_path = os.path.abspath(path)
+                        break
+                
+                if found_path:
+                    lora_path = found_path
+                else:
+                    # If not found, try the original path anyway
+                    lora_path = os.path.abspath(lora_path) if os.path.exists(lora_path) else lora_path
+            
+            # Check if it's a local path
+            if os.path.exists(lora_path):
+                # It's a local path - use it directly
+                if os.path.isdir(lora_path):
+                    # If it's a directory, check for the safetensors file
+                    safetensors_path = os.path.join(lora_path, "pytorch_lora_weights.safetensors")
+                    if os.path.exists(safetensors_path):
+                        # Load from directory (diffusers will find the safetensors file)
+                        pipe.load_lora_weights(lora_path, adapter_name="arabic")
+                        print(f"Loaded Arabic LoRA from local directory: {lora_path}")
+                    else:
+                        raise FileNotFoundError(f"LoRA weights not found in {lora_path}. Expected: {safetensors_path}")
+                else:
+                    # It's a file path
+                    pipe.load_lora_weights(lora_path, adapter_name="arabic")
+                    print(f"Loaded Arabic LoRA from local file: {lora_path}")
+            else:
+                # Try as HuggingFace repo
+                pipe.load_lora_weights(lora_path, adapter_name="arabic")
+                print(f"Loaded Arabic LoRA from HuggingFace: {lora_path}")
         except Exception as e:
             print(f"Warning: Could not load Arabic LoRA: {e}. Continuing without it.")
+            import traceback
+            traceback.print_exc()
+    
+    # Enable CPU offload after loading LoRA
+    pipe.enable_model_cpu_offload()
     
     if args.scheduler == 'overshoot':
         scheduler_config = pipe.scheduler.config
