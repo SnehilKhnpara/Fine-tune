@@ -66,19 +66,9 @@ class OCRGuidedLoss(nn.Module):
         to_pil = transforms.ToPILImage()
         pil_image = to_pil(image.cpu())
         
-        # Run OCR
+        # Run OCR through the wrapper (handles PaddleOCR / Tesseract internally)
         try:
-            if hasattr(self.ocr_model, 'ocr'):
-                # PaddleOCR
-                result = self.ocr_model.ocr(pil_image, cls=False)
-                if result and result[0]:
-                    text = result[0][0][1][0]  # Extract text from PaddleOCR format
-                    return text
-            else:
-                # Tesseract or other
-                import pytesseract
-                text = pytesseract.image_to_string(pil_image, lang='ara')
-                return text.strip()
+            return self.ocr_model.ocr(pil_image)
         except Exception as e:
             print(f"OCR error: {e}")
             return ""
