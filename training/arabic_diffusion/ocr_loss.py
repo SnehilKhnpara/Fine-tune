@@ -39,7 +39,10 @@ class OCRWrapper:
         if self.ocr_type == "paddleocr":
             try:
                 from paddleocr import PaddleOCR
-                self.model = PaddleOCR(use_angle_cls=True, lang='ar', use_gpu=torch.cuda.is_available())
+                # Newer versions of PaddleOCR no longer accept `use_gpu` as an argument.
+                # To stay compatible across versions, we avoid passing it explicitly
+                # and let PaddleOCR decide based on the installed paddlepaddle backend.
+                self.model = PaddleOCR(use_angle_cls=True, lang='ar')
                 print("PaddleOCR initialized successfully")
             except ImportError:
                 print("PaddleOCR not available, falling back to Tesseract")
