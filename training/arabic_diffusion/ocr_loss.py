@@ -10,6 +10,8 @@ NOTE: OCR is ONLY used during training, NEVER during inference.
 
 import os
 from typing import Optional, Union
+
+import numpy as np
 import torch
 from PIL import Image
 
@@ -83,7 +85,9 @@ class OCRWrapper:
         if self.model is None:
             return ""
         
-        # Convert tensor to PIL if needed
+        # Normalize inputs:
+        # - If tensor: convert to PIL first
+        # - If PIL: convert to NumPy array before passing to underlying OCR
         if isinstance(image, torch.Tensor):
             from torchvision import transforms
             # Denormalize
@@ -91,16 +95,23 @@ class OCRWrapper:
             image = torch.clamp(image, 0, 1)
             to_pil = transforms.ToPILImage()
             image = to_pil(image.cpu())
+
+        if isinstance(image, Image.Image):
+            # PaddleOCR expects a NumPy array or a file path.
+            # Convert PIL.Image -> np.ndarray (RGB)
+            image_np = np.array(image)
+        else:
+            image_np = image
         
         try:
             if self.ocr_type == "paddleocr":
                 # PaddleOCR format. Newer versions may not accept `cls` arg,
                 # so we try with it first, then fall back without it.
                 try:
-                    result = self.model.ocr(image, cls=False)
+                    result = self.model.ocr(image_np, cls=False)
                 except TypeError:
                     # Older / different API: no `cls` keyword
-                    result = self.model.ocr(image)
+                    result = self.model.ocr(image_np)
                 if result and result[0] and len(result[0]) > 0:
                     # Extract text from first detection
                     text = result[0][0][1][0]  # Format: [[bbox, (text, confidence)]]
