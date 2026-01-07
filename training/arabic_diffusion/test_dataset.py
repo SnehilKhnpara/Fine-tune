@@ -114,3 +114,4 @@ if __name__ == "__main__":
     success = test_dataset(args.arabic_words_file, args.output_dir)
     sys.exit(0 if success else 1)
 
+
