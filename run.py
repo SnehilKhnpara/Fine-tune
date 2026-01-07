@@ -128,13 +128,14 @@ def run(args):
         if has_arabic:
             print(f"  → Arabic text detected in prompt")
             
-            # SD3 requires some English text in the prompt. If prompt is Arabic-only,
-            # wrap it in a simple English description to make the encoder happy.
+            # SD3's prompt encoder expects a specific format. If prompt is Arabic-only,
+            # wrap it in a complete English description that SD3 can parse.
             # Check if prompt is ONLY Arabic (no English words)
             has_english = any(c.isalpha() and ord(c) < 128 for c in prompt_text)
             if not has_english:
-                # Pure Arabic text - add English context for SD3 encoder
-                prompt_text = f"Arabic text: {prompt_text}"
+                # Pure Arabic text - use a complete English description for SD3
+                # This format works better with SD3's prompt parsing
+                prompt_text = f"A poster with the Arabic text '{prompt_text}'"
                 print(f"  → Wrapped in English context: {prompt_text[:50]}...")
         
         output = pipe(
