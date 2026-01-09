@@ -11,5 +11,10 @@ accelerate==1.4.0
 sentencepiece==0.2.0
 protobuf==5.29.3
 
+# Arabic text rendering dependencies
+arabic-reshaper>=3.0.0
+python-bidi>=0.4.2
+Pillow>=10.0.0
+
 # Note: 'diffusers' is NOT listed here because it is installed 
 # from the './diffusion-amo' (or your actual submodule name) submodule using 'pip install -e'.
