@@ -32,8 +32,7 @@ def run(args):
         guidance_scale = 3.5
     
     # Load Arabic LoRA BEFORE enabling CPU offload to avoid dtype issues
-    # Load Arabic LoRA if specified (Approach 3: Fine-tuned Arabic Diffusion)
-    if args.arabic_diffusion_mode != "off" and args.arabic_lora_path:
+    if args.arabic_lora_path:
         try:
             # Handle both local paths and HuggingFace repo IDs
             lora_path = args.arabic_lora_path
@@ -123,21 +122,6 @@ def run(args):
         prompt_text = prompts[i].strip()
         print(f"\n[{i+1}/{len(prompts)}] Generating: {prompt_text[:50]}...")
         
-        # Check if prompt contains Arabic
-        has_arabic = any('\u0600' <= char <= '\u06FF' for char in prompt_text)
-        if has_arabic:
-            print(f"  → Arabic text detected in prompt")
-            
-            # SD3's prompt encoder expects a specific format. If prompt is Arabic-only,
-            # wrap it in a complete English description that SD3 can parse.
-            # Check if prompt is ONLY Arabic (no English words)
-            has_english = any(c.isalpha() and ord(c) < 128 for c in prompt_text)
-            if not has_english:
-                # Pure Arabic text - use a complete English description for SD3
-                # This format works better with SD3's prompt parsing
-                prompt_text = f"A poster with the Arabic text '{prompt_text}'"
-                print(f"  → Wrapped in English context: {prompt_text[:50]}...")
-        
         output = pipe(
             prompt=prompt_text,
             num_inference_steps=args.num_inference_steps,
@@ -148,20 +132,6 @@ def run(args):
             use_att=args.use_att, 
         )
         image = output.images[0]
-        
-        # Approach 3: Optional validation and fallback
-        # If Arabic diffusion mode is "hybrid", validate and fallback to mask/overlay if needed
-        if args.arabic_diffusion_mode == "hybrid":
-            # Check if Arabic text is in prompt (simple heuristic)
-            prompt_text = prompts[i].strip()
-            # Simple Arabic character detection (Unicode range for Arabic)
-            has_arabic = any('\u0600' <= char <= '\u06FF' for char in prompt_text)
-            
-            if has_arabic:
-                # Optional: Quick OCR check (can be disabled for speed)
-                # For now, we trust the model output but note that fallback should be implemented
-                # in production using Approach 1 (mask/overlay)
-                pass
         
         image.save(img_save_path)
 
@@ -183,29 +153,15 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=10, help="seed")
     parser.add_argument("--img_size", type=int, default=1024, help="image size")
     
-    # Approach 3: Fine-tuned Arabic Diffusion flags
-    parser.add_argument(
-        "--arabic_diffusion_mode",
-        type=str,
-        default="off",
-        choices=["off", "hybrid", "model_only"],
-        help="Arabic diffusion mode: 'off' (default, Approach 1/2 only), "
-             "'hybrid' (model + mask fallback, recommended), "
-             "'model_only' (research/testing only)"
-    )
+    # Arabic LoRA loading
     parser.add_argument(
         "--arabic_lora_path",
         type=str,
         default=None,
-        help="Path to Arabic LoRA weights (required if arabic_diffusion_mode != 'off')"
+        help="Path to Arabic LoRA weights directory or file"
     )
     
     args = parser.parse_args()
-    
-    # Validation
-    if args.arabic_diffusion_mode != "off" and not args.arabic_lora_path:
-        print("Warning: arabic_diffusion_mode is set but arabic_lora_path is not provided.")
-        print("Continuing without Arabic LoRA.")
     
     run(args)
     
